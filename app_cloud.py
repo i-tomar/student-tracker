@@ -94,7 +94,8 @@ def render_progress(label: str, pct: float, color: str) -> str:
 class VideoProcessor:
     def __init__(self):
         self.classifier = AttentionClassifier()
-        self.stats = st.session_state["session_stats"]
+        # FIX: Initialize a local stats object instead of pulling from session_state
+        self.stats = SessionStats() 
         
         # Initialize MediaPipe
         base_options = mp_python.BaseOptions(model_asset_path='face_landmarker.task')
@@ -111,7 +112,6 @@ class VideoProcessor:
         img = frame.to_ndarray(format="bgr24")
         h, w = img.shape[:2]
         
-        # Inference
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         curr_ms = int(time.time() * 1000)
@@ -133,21 +133,18 @@ class VideoProcessor:
         else:
             self.classifier.reset()
 
-        # Update stats
-        new_alerts = self.stats.update(state)
+        # Update the local stats object
+        self.stats.update(state)
         
-        # Send data to UI thread via Queue
+        # Send a summary of the stats back to the UI
         if not result_queue.full():
             result_queue.put({
-                "state": state, "ear": ear, 
-                "pose": (pitch, yaw, roll), 
-                "alerts": new_alerts
+                "state": state, 
+                "ear": ear, 
+                "pose": (pitch, yaw, roll),
+                "summary": self.stats.summary_dict() # Send the whole stats dictionary
             })
 
-        # ML Data Collection (if enabled in UI thread)
-        # Note: In WebRTC, writing to file is safer inside the callback
-        
-        # Annotate for user feedback
         img = annotate_frame(img, state, ear, pitch, yaw, roll)
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -201,27 +198,13 @@ with col_dash:
 # This loop keeps the Streamlit dashboard ticking while the camera runs
 while ctx.state.playing:
     try:
-        # Get data from the video processor
         data = result_queue.get(timeout=1.0)
         
-        # 1. Update State Badge
+        # Update the UI with the data from the background thread
         state_ph.markdown(render_state_badge(data["state"]), unsafe_allow_html=True)
         
-        # 2. Update Alerts
-        if data["alerts"]:
-            for a in data["alerts"]:
-                if a not in st.session_state["alerts"]:
-                    st.session_state["alerts"].append(a)
-            
-        alert_html = ""
-        # Keep only the last 2 alerts for UI space
-        for a in st.session_state["alerts"][-2:]:
-            cls = "break-banner" if "â˜•" in a else "alert-banner"
-            alert_html += f'<div class="{cls}">{a}</div>'
-        alert_placeholder.markdown(alert_html, unsafe_allow_html=True)
-
-        # 3. Update Stats Tiles
-        s = st.session_state["session_stats"].summary_dict()
+        # Update Stats Tiles using the summary we sent
+        s = data["summary"]
         stats_ph.markdown(f'''
             <div class="stat-row">
                 {render_stat_tile("Session", format_duration(s["total_sec"]))}
@@ -230,22 +213,25 @@ while ctx.state.playing:
             </div>
         ''', unsafe_allow_html=True)
 
-        # 4. Update Progress
+        # Update Progress
         prog_ph.markdown(
             render_progress("Focus Intensity", s["focus_pct"], "#4ae176") +
             render_progress("Distraction Level", s["distract_pct"], "#ec6a06"),
             unsafe_allow_html=True
         )
 
-        # 5. Pose Metrics
+        # Pose Metrics
         p, y, r = data["pose"]
         pose_ph.markdown(f'''
             <div class="stat-row">
                 {render_stat_tile("EAR", f"{data['ear']:.2f}")}
-                {render_stat_tile("Pitch", f"{p:+.0f}Â°")}
-                {render_stat_tile("Yaw", f"{y:+.0f}Â°")}
+                {render_stat_tile("Pitch", f"{p:+.0f}°")}
+                {render_stat_tile("Yaw", f"{y:+.0f}°")}
             </div>
         ''', unsafe_allow_html=True)
+        
+        # Save the latest stats to session state so the AI Coach can see them later
+        st.session_state["latest_summary"] = s
 
     except queue.Empty:
         continue
