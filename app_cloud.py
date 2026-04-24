@@ -27,7 +27,7 @@ except ImportError:
     SOUND_AVAILABLE = False 
 
 # ==========================================
-# Page Config & Styles (Preserved from your code)
+# Page Config & Styles
 # ==========================================
 st.set_page_config(page_title="AI Study Companion", layout="wide")
 
@@ -57,9 +57,9 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 """, unsafe_allow_html=True)
 
 # ==========================================
-# Shared Resources & State
+# Data Bridge Setup
 # ==========================================
-# We use a Queue to pass data from the Video Thread back to the Streamlit UI Thread
+# This Queue passes data from the Camera Thread to the UI Thread
 result_queue = queue.Queue(maxsize=10)
 
 def _init_state():
@@ -67,12 +67,12 @@ def _init_state():
         st.session_state["session_stats"] = SessionStats()
     if "chat_history" not in st.session_state:
         st.session_state["chat_history"] = []
-    if "alerts" not in st.session_state:
-        st.session_state["alerts"] = []
+    if "latest_summary" not in st.session_state:
+        st.session_state["latest_summary"] = None
 
 _init_state()
 
-# --- Helper Functions for UI ---
+# --- UI Helpers ---
 STATE_BADGE_COLORS = {
     STATE_FOCUSED: ("#4ae176", "#003111"), STATE_DISTRACTED: ("#ec6a06", "#4a1c00"),
     STATE_SLEEPING: ("#ffb4ab", "#690005"), STATE_NO_FACE: ("#8c909f", "#1e293b"),
@@ -89,13 +89,12 @@ def render_progress(label: str, pct: float, color: str) -> str:
     return f'<div class="prog-wrap"><div class="prog-label"><span>{label}</span><span>{pct:.1f}%</span></div><div class="prog-bar-bg"><div style="width:{pct}%;background:{color};height:6px;border-radius:999px;"></div></div></div>'
 
 # ==========================================
-# WebRTC Video Processing Class
+# Video Processor (The Brain)
 # ==========================================
 class VideoProcessor:
     def __init__(self):
         self.classifier = AttentionClassifier()
-        # FIX: Initialize a local stats object instead of pulling from session_state
-        self.stats = SessionStats() 
+        self.stats = SessionStats() # Keep stats local to the camera thread
         
         # Initialize MediaPipe
         base_options = mp_python.BaseOptions(model_asset_path='face_landmarker.task')
@@ -112,6 +111,7 @@ class VideoProcessor:
         img = frame.to_ndarray(format="bgr24")
         h, w = img.shape[:2]
         
+        # Process Frame
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         curr_ms = int(time.time() * 1000)
@@ -133,23 +133,23 @@ class VideoProcessor:
         else:
             self.classifier.reset()
 
-        # Update the local stats object
+        # Update stats
         self.stats.update(state)
         
-        # Send a summary of the stats back to the UI
+        # Send data to dashboard
         if not result_queue.full():
             result_queue.put({
-                "state": state, 
-                "ear": ear, 
-                "pose": (pitch, yaw, roll),
-                "summary": self.stats.summary_dict() # Send the whole stats dictionary
+                "state": state, "ear": ear, 
+                "pose": (pitch, yaw, roll), 
+                "summary": self.stats.summary_dict()
             })
 
+        # Visual feedback on camera
         img = annotate_frame(img, state, ear, pitch, yaw, roll)
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # ==========================================
-# Main UI Layout
+# Main Layout
 # ==========================================
 st.markdown('<div class="app-header"><p class="app-title">AI Study Companion</p><p class="app-sub">Real-time attention tracking</p></div>', unsafe_allow_html=True)
 
@@ -158,52 +158,49 @@ col_cam, col_dash = tab_live.columns([3, 2], gap="medium")
 
 with col_cam:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    
-    # WebRTC Streamer (The Core Component)
+    # The Webcam Component
     ctx = webrtc_streamer(
-        key="attention-tracker",
+        key="student-cam",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
         video_processor_factory=VideoProcessor,
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
-    
-    alert_placeholder = st.empty()
     st.markdown("</div>", unsafe_allow_html=True)
 
 with col_dash:
-    # State Badge
+    # 1. State Card
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     st.markdown("#### Current State")
     state_ph = st.empty()
+    state_ph.markdown(render_state_badge(STATE_NO_FACE), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Session Metrics
+    # 2. Stats Dashboard
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     st.markdown("#### Session Stats")
     stats_ph = st.empty()
     prog_ph = st.empty()
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Pose metrics
+    # 3. Head Pose
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     st.markdown("#### Head-Pose Metrics")
     pose_ph = st.empty()
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ==========================================
-# Background Update Loop
+# Live Dashboard Update Loop
 # ==========================================
-# This loop keeps the Streamlit dashboard ticking while the camera runs
+# This part "catches" the data from the camera and fills the placeholders above
 while ctx.state.playing:
     try:
         data = result_queue.get(timeout=1.0)
         
-        # Update the UI with the data from the background thread
+        # Update Dashboard Elements
         state_ph.markdown(render_state_badge(data["state"]), unsafe_allow_html=True)
         
-        # Update Stats Tiles using the summary we sent
         s = data["summary"]
         stats_ph.markdown(f'''
             <div class="stat-row">
@@ -213,42 +210,61 @@ while ctx.state.playing:
             </div>
         ''', unsafe_allow_html=True)
 
-        # Update Progress
         prog_ph.markdown(
             render_progress("Focus Intensity", s["focus_pct"], "#4ae176") +
             render_progress("Distraction Level", s["distract_pct"], "#ec6a06"),
             unsafe_allow_html=True
         )
 
-        # Pose Metrics
         p, y, r = data["pose"]
         pose_ph.markdown(f'''
             <div class="stat-row">
                 {render_stat_tile("EAR", f"{data['ear']:.2f}")}
-                {render_stat_tile("Pitch", f"{p:+.0f}°")}
-                {render_stat_tile("Yaw", f"{y:+.0f}°")}
+                {render_stat_tile("Pitch", f"{p:+.0f}Â°")}
+                {render_stat_tile("Yaw", f"{y:+.0f}Â°")}
             </div>
         ''', unsafe_allow_html=True)
         
-        # Save the latest stats to session state so the AI Coach can see them later
+        # Save to session state so AI Coach can see it later
         st.session_state["latest_summary"] = s
 
     except queue.Empty:
         continue
 
-# Post-Session Save
-if not ctx.state.playing and st.session_state["session_stats"].total_sec() > 1:
-    if st.button("ðŸ’¾ Save Session Summary"):
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = save_session_summary(st.session_state["session_stats"], f"session_{ts}.csv")
-        st.success(f"Session saved to {path}")
-
-# Post-Session AI Coach (Preserved from your code)
+# ==========================================
+# AI Coach Tab
+# ==========================================
 with tab_coach:
     st.markdown("### Post-Session AI Coach")
-    stats = st.session_state.get("session_stats")
-    if stats.total_sec() < 5:
-        st.info("Finish a study session to get AI insights!")
+    summary = st.session_state["latest_summary"]
+    
+    if not summary or summary["total_sec"] < 5:
+        st.info("ðŸ“ Start a study session in the 'Live Tracker' tab first!")
     else:
-        # (Your AI Coach Chat Logic here...)
-        pass
+        # Display session highlights
+        st.write(f"Based on your last session of **{format_duration(summary['total_sec'])}**:")
+        
+        # Simple rule-based AI Coach response
+        f_pct = summary["focus_pct"]
+        if f_pct > 80:
+            st.success("ðŸŒŸ **Focus Master:** You maintained high attention. Try the Pomodoro technique to stay fresh.")
+        elif summary["distract_pct"] > 30:
+            st.warning("ðŸš§ **Distraction Detected:** You looked away frequently. Check for environment noise or phone notifications.")
+        elif summary["sleep_pct"] > 10:
+            st.error("ðŸ˜´ **Low Energy:** You seem sleepy. Take a 15-minute power nap or stand up and stretch.")
+
+        # Chat interface
+        for msg in st.session_state["chat_history"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+        
+        if prompt := st.chat_input("Ask for study advice..."):
+            st.session_state["chat_history"].append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # Simple Assistant logic
+            response = "I noticed you were focused for " + str(int(f_pct)) + "%. Try setting a smaller goal next time!"
+            st.session_state["chat_history"].append({"role": "assistant", "content": response})
+            with st.chat_message("assistant"):
+                st.markdown(response)
